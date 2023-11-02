@@ -1,0 +1,152 @@
+---
+title: "Project 2"
+author: "FengHua Dong, Hang Liao"
+output: 
+  html_document:
+    toc: true
+    # toc_depth: 1
+    toc_float: true
+    number_sections: true
+    
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE) 
+
+library(gapminder)
+library(dplyr)
+library(ggplot2)
+library(xlsx)
+library(tidyverse)
+library(rvest)
+library(rjson)
+library(glue)
+library(RColorBrewer)
+library(broom)
+library(viridis)
+library(jsonlite)
+library(geojsonio)
+
+```
+
+## Obtain NASDAQ-100 Constituent List and CIK codes
+
+```{r CIK_codes }
+NASDAQ_100 <- read.csv("First.csv")
+#Constituent_list
+NASDAQ_100 <- NASDAQ_100 %>% 
+  filter(conm == "Nasdaq 100", is.na(thru) | thru > 20220101 )
+
+NASDAQ_100_CIK <- NASDAQ_100[,c('co_cik')]
+str(NASDAQ_100_CIK)
+
+# Store CIK codes as a 10-digit string and preserve leading zeros.
+NASDAQ_100_CIK <- str_pad(NASDAQ_100_CIK, 10, side = "left", "0")
+
+
+```
+
+## Collect business address for companies by web scraping
+
+```{r Define a Function to get the address}
+#Make it easy to refer
+cik = NASDAQ_100_CIK 
+
+#A function to read and store address information one by one
+grab_address <- function(cik){
+  
+  edgar_url <- glue("https://data.sec.gov/submissions/CIK{cik}.json")
+  #Get json from sec website
+  company_information <- jsonlite::fromJSON(edgar_url)
+  #Get business address from json
+  address_list <- company_information$addresses$business
+  #if information is missing fill with NA
+  for(i in 1:length(address_list)){
+    if(is.null(address_list[[i]])){
+      address_list[[i]] <- NA_character_
+    }
+  }
+  #Save the as data frame
+  address_df <- as_tibble(address_list) %>% 
+    mutate(cik = cik)
+  Sys.sleep(1)
+  return(address_df)
+  
+}
+
+
+# Make some helper data 
+state_data <- tibble(
+  state = state.name,
+  state_abb = state.abb
+)
+
+#Excute the function
+addresses <-  map(cik, ~ grab_address(.x))
+
+```
+
+## Create a summary table of number of companies by state.
+
+```{r Summary_of_Companies_by_state}
+address_df <- bind_rows(addresses)
+#summary the data by state and count the result
+constituents_by_state <- address_df %>%
+  left_join(state_data, by = c("stateOrCountry" = "state_abb")) %>% 
+  group_by(state) %>% 
+  tally() %>% 
+  arrange(desc(n))
+
+```
+
+## Make a heat map (choropleth map) using the summary table
+
+```{r pressure, results="hide"}
+spdf <- geojson_read("gz_2010_us_040_00_5m.json",  what = "sp")
+
+spdf@data <- spdf@data %>% 
+  mutate(across(c(STATE, GEO_ID), as.numeric))
+
+
+
+# Fortify geo spacial data, remove states outside continential USA
+spdf_fortified <- tidy(spdf, region = "NAME")  %>% 
+  filter(!(id %in% c("Alaska", "Hawaii", 
+                     "Virgin Islands", "Puerto Rico")))
+
+# Plot Outline of US
+ggplot() +
+  geom_polygon(data = spdf_fortified, aes( x = long, y = lat, group = group),
+  fill="white", color="grey") +
+  theme_void() +
+  coord_map()
+
+
+
+
+# Merge random state data with fortified geo spacial data 
+spdf_fortified_merge <- spdf_fortified %>%
+  left_join(constituents_by_state, by = c("id" = "state")) %>% 
+  mutate(
+    category = case_when(
+      is.na(n) ~ "0",
+      between(n, 1, 5) ~ "1-5",
+      between(n, 6, 10) ~ "6-10",
+      between(n, 11 ,30) ~ "11~30",
+      between(n, 30,101) ~ "30+"
+    )
+  )
+
+ggplot() +
+  geom_polygon(data = spdf_fortified_merge,
+               aes(fill = category, x = long, y = lat, group = group)) +
+  theme_void() +
+  coord_map() +
+  labs(
+    title = "Number of Nasdaq Constituents Per State",
+    caption = "Data: WRDS; EDGAR"
+  ) 
+
+
+```
